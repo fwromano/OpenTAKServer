@@ -131,6 +131,23 @@ class ClientController(Thread):
         self.rabbit_channel = channel
         self.rabbit_channel.add_on_close_callback(self.on_channel_close)
 
+        # Ensure the optional WebTAK socketio exchange exists before any publish.
+        # Publishing to a missing exchange closes the AMQP channel and can drop CoT.
+        if self.socketio_publish_enabled:
+            try:
+                self.rabbit_channel.exchange_declare(
+                    exchange="flask-socketio",
+                    exchange_type="fanout",
+                    durable=False,
+                    auto_delete=False,
+                )
+            except BaseException as e:
+                self.logger.warning(
+                    f"Failed to declare RabbitMQ exchange 'flask-socketio': {e}; "
+                    "disabling socketio publish for this client"
+                )
+                self.socketio_publish_enabled = False
+
         # Re-establish queue bindings after channel recovery.
         # On the first open self.bound_queues is empty so this is a no-op.
         for bind in self.bound_queues:
