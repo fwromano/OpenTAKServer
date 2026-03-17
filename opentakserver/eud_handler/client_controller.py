@@ -126,6 +126,59 @@ class ClientController(Thread):
         self.rabbit_connection.channel(on_open_callback=self.on_channel_open)
         self.rabbit_connection.add_on_close_callback(self.on_close)
 
+    def _queue_bind(self, exchange: str, routing_key: str, queue: str):
+        binding = {"exchange": exchange, "routing_key": routing_key, "queue": queue}
+        self.rabbit_channel.queue_bind(exchange=exchange, queue=queue, routing_key=routing_key)
+        if binding not in self.bound_queues:
+            self.bound_queues.append(binding)
+
+    def _ensure_client_routing_bindings(self, platform=None):
+        if not self.rabbit_channel or not self.rabbit_channel.is_open or not self.uid or not self.callsign:
+            return
+
+        if platform in ("OpenTAK ICU", "Meshtastic", "DMRCOT"):
+            return
+
+        self.rabbit_channel.queue_declare(queue=self.callsign)
+        self.rabbit_channel.queue_declare(queue=self.uid)
+
+        with self.app.app_context():
+            if self.is_ssl and self.user:
+                group_memberships = db.session.execute(
+                    db.session.query(GroupUser).filter_by(user_id=self.user.id, direction=Group.OUT)
+                ).all()
+                if not group_memberships:
+                    self.logger.debug(
+                        f"{self.callsign} doesn't belong to any groups, adding them to the __ANON__ group"
+                    )
+                    self._queue_bind("groups", "__ANON__.OUT", self.uid)
+                else:
+                    for membership in group_memberships:
+                        membership = membership[0]
+                        self._queue_bind("groups", f"{membership.group.name}.OUT", self.uid)
+            else:
+                self.logger.debug(
+                    f"{self.callsign} is connected via TCP, adding them to the __ANON__ group"
+                )
+                self._queue_bind("groups", "__ANON__.OUT", self.uid)
+
+        self._queue_bind("missions", "missions", self.uid)
+        self._queue_bind("dms", self.uid, self.uid)
+        self._queue_bind("dms", self.callsign, self.callsign)
+
+        if not self.is_consuming:
+            self.rabbit_channel.basic_consume(
+                queue=self.callsign,
+                on_message_callback=self.on_message,
+                auto_ack=True,
+            )
+            self.rabbit_channel.basic_consume(
+                queue=self.uid,
+                on_message_callback=self.on_message,
+                auto_ack=True,
+            )
+            self.is_consuming = True
+
     def on_channel_open(self, channel: Channel):
         self.logger.debug(f"Opening RabbitMQ channel for {self.callsign or self.address}")
         self.rabbit_channel = channel
@@ -161,23 +214,13 @@ class ClientController(Thread):
             except Exception as e:
                 self.logger.warning(f"Failed to re-bind queue {bind}: {e}")
 
-        # Re-start consumers if we already have a device identity (channel recovery).
+        # If a client SA arrived before RabbitMQ finished opening, finish queue/binding
+        # setup now so the connection starts receiving routed CoT.
         if self.uid and self.callsign:
             try:
-                self.rabbit_channel.queue_declare(queue=self.callsign)
-                self.rabbit_channel.queue_declare(queue=self.uid)
-                self.rabbit_channel.basic_consume(
-                    queue=self.callsign,
-                    on_message_callback=self.on_message,
-                    auto_ack=True,
-                )
-                self.rabbit_channel.basic_consume(
-                    queue=self.uid,
-                    on_message_callback=self.on_message,
-                    auto_ack=True,
-                )
+                self._ensure_client_routing_bindings(self.platform)
             except Exception as e:
-                self.logger.warning(f"Failed to re-start consumers after recovery: {e}")
+                self.logger.warning(f"Failed to initialize client routing after channel open: {e}")
 
         for message in self.cached_messages:
             self.route_cot(message)
@@ -212,6 +255,7 @@ class ClientController(Thread):
             f"RabbitMQ channel closed for {self.callsign or self.address}: {error!r}"
         )
         self.rabbit_channel = None
+        self.is_consuming = False
 
         # Some deployments do not declare the flask-socketio exchange.
         # If a publish attempt closes the channel for that reason, disable
@@ -562,136 +606,12 @@ class ClientController(Thread):
 
             if "callsign" in contact.attrs:
                 self.callsign = contact.attrs["callsign"]
-
-                # Declare a RabbitMQ Queue for this uid and join the 'dms' and 'cot' exchanges
-                if (
-                    self.rabbit_channel
-                    and self.rabbit_channel.is_open
-                    and platform != "OpenTAK ICU"
-                    and platform != "Meshtastic"
-                    and platform != "DMRCOT"
-                ):
-
-                    self.logger.debug(f"Declaring queue for {self.callsign} {self.uid}")
-                    self.rabbit_channel.queue_declare(queue=self.callsign)
-                    self.rabbit_channel.queue_declare(queue=self.uid)
-
-                    with self.app.app_context():
-                        if self.is_ssl:
-                            group_memberships = db.session.execute(
-                                db.session.query(GroupUser).filter_by(
-                                    user_id=self.user.id, direction=Group.OUT
-                                )
-                            ).all()
-                            if not group_memberships:
-                                self.logger.debug(
-                                    f"{self.callsign} doesn't belong to any groups, adding them to the __ANON__ group"
-                                )
-                                self.rabbit_channel.queue_bind(
-                                    exchange="groups", queue=self.uid, routing_key="__ANON__.OUT"
-                                )
-                                if {
-                                    "exchange": "groups",
-                                    "routing_key": "__ANON__.OUT",
-                                    "queue": self.uid,
-                                } not in self.bound_queues:
-                                    self.bound_queues.append(
-                                        {
-                                            "exchange": "groups",
-                                            "routing_key": "__ANON__.OUT",
-                                            "queue": self.uid,
-                                        }
-                                    )
-
-                            elif group_memberships and self.is_ssl:
-                                for membership in group_memberships:
-                                    membership = membership[0]
-                                    self.rabbit_channel.queue_bind(
-                                        exchange="groups",
-                                        queue=self.uid,
-                                        routing_key=f"{membership.group.name}.OUT",
-                                    )
-
-                                    if {
-                                        "exchange": "groups",
-                                        "routing_key": f"{membership.group.name}.OUT",
-                                        "queue": self.uid,
-                                    } not in self.bound_queues:
-                                        self.bound_queues.append(
-                                            {
-                                                "exchange": "groups",
-                                                "routing_key": f"{membership.group.name}.OUT",
-                                                "queue": self.uid,
-                                            }
-                                        )
-
-                        self.rabbit_channel.queue_bind(
-                            exchange="missions", routing_key="missions", queue=self.uid
-                        )
-                        if {
-                            "exchange": "missions",
-                            "routing_key": "missions",
-                            "queue": self.uid,
-                        } not in self.bound_queues:
-                            self.bound_queues.append(
-                                {
-                                    "exchange": "missions",
-                                    "routing_key": "missions",
-                                    "queue": self.uid,
-                                }
-                            )
-
-                        # The DMs queue also binds by callsign since the <dest> tag in CoT messages can be by callsign instead of UID
-                        self.rabbit_channel.queue_bind(
-                            exchange="dms", queue=self.uid, routing_key=self.uid
-                        )
-                        self.rabbit_channel.queue_bind(
-                            exchange="dms", queue=self.callsign, routing_key=self.callsign
-                        )
-
-                        if {
-                            "exchange": "dms",
-                            "routing_key": self.uid,
-                            "queue": self.uid,
-                        } not in self.bound_queues:
-                            self.bound_queues.append(
-                                {"exchange": "dms", "routing_key": self.uid, "queue": self.uid}
-                            )
-
-                        if {
-                            "exchange": "dms",
-                            "routing_key": self.callsign,
-                            "queue": self.callsign,
-                        } not in self.bound_queues:
-                            self.bound_queues.append(
-                                {
-                                    "exchange": "dms",
-                                    "routing_key": self.callsign,
-                                    "queue": self.callsign,
-                                }
-                            )
-
-                        if not self.is_ssl:
-                            self.logger.debug(
-                                f"{self.callsign} is connected via TCP, adding them to the __ANON__ group"
-                            )
-                            self.rabbit_channel.queue_bind(
-                                exchange="groups", queue=self.uid, routing_key="__ANON__.OUT"
-                            )
-                            self.bound_queues.append(
-                                {
-                                    "exchange": "groups",
-                                    "routing_key": "__ANON__.OUT",
-                                    "queue": self.uid,
-                                }
-                            )
-
-                        self.rabbit_channel.basic_consume(
-                            queue=self.callsign, on_message_callback=self.on_message, auto_ack=True
-                        )
-                        self.rabbit_channel.basic_consume(
-                            queue=self.uid, on_message_callback=self.on_message, auto_ack=True
-                        )
+                if self.rabbit_channel and self.rabbit_channel.is_open:
+                    self._ensure_client_routing_bindings(platform)
+                else:
+                    self.logger.debug(
+                        f"RabbitMQ channel not ready; deferring queue setup for {self.callsign} {self.uid}"
+                    )
 
             if "phone" in contact.attrs and contact.attrs["phone"]:
                 self.phone_number = contact.attrs["phone"]
@@ -889,30 +809,71 @@ class ClientController(Thread):
     def send_disconnect_cot(self):
         if self.uid:
             now = datetime.datetime.now(datetime.timezone.utc)
-            stale = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=10)
+            stale = now - datetime.timedelta(seconds=1)
+            lat = lon = 0
+            hae = 0
+            ce = le = 9999999
+            event_type = "a-f-G-U-C"
+            how = "m-g"
+            callsign = self.callsign or self.uid
+            team_name = "Cyan"
+            team_role = "Team Member"
+
+            with self.app.app_context():
+                latest_point = (
+                    self.db.session.query(Point)
+                    .filter(Point.device_uid == self.uid)
+                    .order_by(Point.timestamp.desc(), Point.id.desc())
+                    .first()
+                )
+                eud = self.db.session.execute(select(EUD).filter_by(uid=self.uid)).first()
+                eud = eud[0] if eud else None
+
+                if latest_point:
+                    lat = latest_point.latitude or 0
+                    lon = latest_point.longitude or 0
+                    hae = latest_point.hae or 0
+                    ce = latest_point.ce or 9999999
+                    le = latest_point.le or 9999999
+                    if latest_point.cot and latest_point.cot.type:
+                        event_type = latest_point.cot.type
+                    if latest_point.cot and latest_point.cot.how:
+                        how = latest_point.cot.how
+
+                if eud:
+                    callsign = eud.callsign or callsign
+                    if eud.team:
+                        team_name = eud.team.name or team_name
+                    if eud.team_role:
+                        team_role = eud.team_role
 
             event = Element(
                 "event",
                 {
-                    "how": "h-g-i-g-o",
-                    "type": "t-x-d-d",
+                    "how": how,
+                    "type": event_type,
                     "version": "2.0",
-                    "uid": str(uuid.uuid4()),
+                    "uid": self.uid,
                     "start": iso8601_string_from_datetime(now),
                     "time": iso8601_string_from_datetime(now),
                     "stale": iso8601_string_from_datetime(stale),
                 },
             )
-            point = SubElement(
+            SubElement(
                 event,
                 "point",
-                {"ce": "9999999", "le": "9999999", "hae": "0", "lat": "0", "lon": "0"},
+                {
+                    "ce": str(ce),
+                    "le": str(le),
+                    "hae": str(hae),
+                    "lat": str(lat),
+                    "lon": str(lon),
+                },
             )
             detail = SubElement(event, "detail")
-            link = SubElement(
-                detail, "link", {"relation": "p-p", "uid": self.uid, "type": "a-f-G-U-C"}
-            )
-            flow_tags = SubElement(
+            SubElement(detail, "contact", {"callsign": callsign})
+            SubElement(detail, "__group", {"name": team_name, "role": team_role})
+            SubElement(
                 detail,
                 "_flow-tags_",
                 {"TAK-Server-f1a8159ef7804f7a8a32d8efc4b773d0": iso8601_string_from_datetime(now)},
