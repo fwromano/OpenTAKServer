@@ -31,6 +31,7 @@ from opentakserver.models.Meshtastic import MeshtasticChannel
 from opentakserver.models.Mission import Mission
 from opentakserver.models.MissionChange import MissionChange, generate_mission_change_cot
 from opentakserver.models.MissionUID import MissionUID
+from opentakserver.models.Point import Point
 from opentakserver.models.Team import Team
 
 
