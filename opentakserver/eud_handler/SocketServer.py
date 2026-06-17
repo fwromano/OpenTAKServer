@@ -14,6 +14,7 @@ class SocketServer:
         self.shutdown = False
         self.daemon = True
         self.socket = None
+        self.ssl_context = None
         self.clients = []
         self.app_context = app_context
         # self.socketio = SocketIO(message_queue="amqp://" + self.app_context.app.config.get("OTS_RABBITMQ_SERVER_ADDRESS"), async_mode='gevent')
@@ -31,10 +32,16 @@ class SocketServer:
 
         while not self.shutdown:
             try:
-                sock, addr = self.socket.accept()
+                client_sock, addr = self.socket.accept()
                 if self.ssl:
+                    sock = self.ssl_context.wrap_socket(
+                        client_sock,
+                        server_side=True,
+                        do_handshake_on_connect=False,
+                    )
                     self.logger.info("New SSL connection from {}".format(addr[0]))
                 else:
+                    sock = client_sock
                     self.logger.info("New TCP connection from {}".format(addr[0]))
 
                 new_thread = ClientController(
@@ -50,6 +57,9 @@ class SocketServer:
                 if self.shutdown:
                     self.socket.shutdown(socket.SHUT_RDWR)
                     self.socket.close()
+            except ssl.SSLError as e:
+                self.logger.warning("SSL accept/wrap failed: {}".format(e))
+                self.logger.debug(traceback.format_exc())
             except (OSError, IOError) as e:
                 if "too many open files" in str(e).lower():
                     self.logger.error("too many open files: " + str(e))
@@ -72,21 +82,20 @@ class SocketServer:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("0.0.0.0", self.port))
-        s.listen(1)
+        s.listen(128)
 
         return s
 
     def launch_ssl_server(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-            context = self.get_ssl_context()
+        self.ssl_context = self.get_ssl_context()
 
-            sconn = context.wrap_socket(sock, server_side=True)
-            sconn.bind(("0.0.0.0", self.port))
-            sconn.listen(0)
+        sock.bind(("0.0.0.0", self.port))
+        sock.listen(128)
 
-            return sconn
+        return sock
 
     def stop(self):
         if self.ssl:
