@@ -45,10 +45,11 @@ class SocketServer:
                     self.logger.info("New TCP connection from {}".format(addr[0]))
 
                 new_thread = ClientController(
-                    addr[0], addr[1], sock, self.logger, self.app_context.app, self.ssl
+                    addr[0], addr[1], sock, self.logger, self.app_context.app, self.ssl, server=self
                 )
                 new_thread.daemon = True
                 new_thread.start()
+                self.clients = [c for c in self.clients if c.is_alive()]
                 self.clients.append(new_thread)
             except KeyboardInterrupt:
                 self.socket.close()
@@ -96,6 +97,34 @@ class SocketServer:
         sock.listen(128)
 
         return sock
+
+    def displace_older_connections(self, controller):
+        """Close every other live connection claiming the same EUD uid.
+
+        The displaced flag makes the old connection's teardown skip the
+        shared-queue unbind and the disconnect CoT, since the device is still
+        online through `controller`.
+        """
+        for client in list(self.clients):
+            if (
+                client is not controller
+                and not client.shutdown
+                and client.uid == controller.uid
+            ):
+                self.logger.info(
+                    "Displacing older connection for {} from {}".format(
+                        controller.uid, client.address
+                    )
+                )
+                client.displaced = True
+                client.stop()
+
+    def has_live_uid(self, uid, exclude):
+        """True if another live connection (not `exclude`) claims this uid."""
+        for client in list(self.clients):
+            if client is not exclude and not client.shutdown and client.uid == uid:
+                return True
+        return False
 
     def stop(self):
         if self.ssl:

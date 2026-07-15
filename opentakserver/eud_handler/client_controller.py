@@ -36,7 +36,9 @@ from opentakserver.models.Team import Team
 
 
 class ClientController(Thread):
-    def __init__(self, address: str, port: int, sock: socket, logger, app: Flask, is_ssl: bool):
+    def __init__(
+        self, address: str, port: int, sock: socket, logger, app: Flask, is_ssl: bool, server=None
+    ):
         Thread.__init__(self)
         self.address = address
         self.port = port
@@ -49,6 +51,18 @@ class ClientController(Thread):
         self.is_ssl = is_ssl
         self.bound_queues = []
         self.eud = None
+        # The SocketServer that owns this connection. Used to find other live
+        # connections for the same EUD uid so that duplicate/zombie sockets
+        # can be displaced and cannot tear down the survivor's queue bindings.
+        self.server = server
+        # Set when a newer connection for the same uid takes over. A displaced
+        # connection must not unbind the shared RabbitMQ queues or broadcast a
+        # disconnect CoT -- the device is still online through the new socket.
+        self.displaced = False
+        # Initialized early so a failed SSL handshake can run close_connection
+        # before the RabbitMQ block below assigns the real values.
+        self.rabbit_connection = None
+        self.rabbit_channel: Channel | None = None
         # Per-client guard for socketio publish path. If broker rejects the
         # flask-socketio exchange, disable subsequent publishes for this client
         # to avoid channel close/recovery loops.
@@ -501,8 +515,18 @@ class ClientController(Thread):
         # on_channel_close does not attempt recovery for a dying client.
         self.shutdown = True
 
-        self.unbind_rabbitmq_queues()
-        self.send_disconnect_cot()
+        # The RabbitMQ queues are shared by every socket a device opens (they
+        # are named by uid/callsign), so only the LAST live connection for
+        # this uid may unbind them or announce the device offline. A zombie
+        # socket dying after its device already reconnected used to sever the
+        # new connection's bindings, leaving the device able to send but
+        # never receive.
+        last_connection_for_uid = not self.displaced and not (
+            self.server and self.uid and self.server.has_live_uid(self.uid, exclude=self)
+        )
+        if last_connection_for_uid:
+            self.unbind_rabbitmq_queues()
+            self.send_disconnect_cot()
 
         if (
             self.rabbit_channel
@@ -598,6 +622,13 @@ class ClientController(Thread):
         # Only assume it's an EUD if it's got a <contact> tag
         if contact and uid and not uid.endswith("ping") and (self.user or not self.is_ssl):
             self.uid = uid
+
+            # Official TAK Server semantics: the newest connection for an EUD
+            # identity wins. Displace any older socket for this uid so it
+            # cannot round-robin-consume (and silently drop) this device's
+            # inbound CoT from the shared uid/callsign queues.
+            if self.server:
+                self.server.displace_older_connections(self)
             device = operating_system = platform = version = None
             if takv:
                 device = takv.attrs["device"] if "device" in takv.attrs else None
